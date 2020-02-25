@@ -1,145 +1,193 @@
 import os                   # Path setting and file-retrieval
 import cv2                  # OpenCV
-import time                 # Timing Execution
 import numpy as np          # See above
 import CONFIG as cfg        # Debug flags and constants
+import CoreFunctions as cf  # Common functions
 from shutil import rmtree   # Directory removal
-import secrets              # CSPRNG
-import warnings             # Ignore integer overflow during diffusion
+from time import perf_counter
+from random import randint
 
 #PyCUDA Import
 import pycuda.driver as cuda
 import pycuda.autoinit
-from pycuda.compiler import SourceModule
-
-warnings.filterwarnings("ignore", category=RuntimeWarning)
 
 #os.chdir(cfg.PATH)
 
-# Path-check and image reading
-def Init():
+def PreProcess():
+    # Initiliaze misc_timer
+    if cfg.DEBUG_IMAGES:
+        misc_timer = np.zeros(7)
+    else:
+        misc_timer = np.zeros(6)
+
+    misc_timer[0] = perf_counter()
+    # Check if ./images directory exists
+    """if not os.path.exists(cfg.SRC):
+        print("Input directory does not exist!")
+        raise SystemExit(0)
+    else:
+        if os.path.isfile(cfg.ENC_OUT):
+            os.remove(cfg.ENC_OUT)
+        if os.path.isfile(cfg.DEC_OUT):
+            os.remove(cfg.DEC_OUT)"""
+        
+    # Check if ./temp directory exists
+    """if os.path.exists(cfg.TEMP):
+        rmtree(cfg.TEMP)
+    os.makedirs(cfg.TEMP)
+    misc_timer[0] = perf_counter() - misc_timer[0]
+
+    misc_timer[1] = perf_counter()"""
     # Open Image
-    img = cv2.imread(cfg.ENC_IN,-1)
+    img = cv2.imread(cfg.ENC_IN, 1)
     if img is None:
         print("File does not exist!")
         raise SystemExit(0)
-    return img, img.shape[0], img.shape[1]
+    # Pad Image so no. of rows and columns is even
+    for i in range(2):
+        dim_list = list(img.shape)
+        if dim_list[i]&1==1:
+            dim_list[i] = 1
+            line = np.empty(dim_list,dtype=np.uint8)
+            img = np.concatenate((img, line), axis=i)
+    misc_timer[1] = perf_counter() - misc_timer[1]
 
-# Generate and return rotation vector of length n containing values < m
-def genRelocVec(m, n, logfile):
-    # Initialize constants
-    secGen = secrets.SystemRandom()
-    a = secGen.randint(2,cfg.PERMINTLIM)
-    b = secGen.randint(2,cfg.PERMINTLIM)
-    c = 1 + a*b
-    x = secGen.uniform(0.0001,1.0)
-    y = secGen.uniform(0.0001,1.0)
-    offset = secGen.randint(1,cfg.PERMINTLIM)
-    unzero = 0.0000001
+    # Write original dimensions to file
+    misc_timer[2] = perf_counter()
+    dim = img.shape
+    with open(cfg.LOG, 'w+') as f:
+        f.write(str(dim[0]) + "\n")
+        f.write(str(dim[1]) + "\n")
+    misc_timer[2] = perf_counter() - misc_timer[2]
+    return img, img.shape, misc_timer
 
-    # Log parameters for decryption
-    with open(logfile, 'w+') as f:
-        f.write(str(a) +"\n")
-        f.write(str(b) +"\n")
-        f.write(str(x) +"\n")
-        f.write(str(y) +"\n")
-        f.write(str(offset) + "\n")
-
-    # Skip first <offset> values
-    for i in range(offset):
-        x = (x + a*y)%1 + unzero
-        y = (b*x + c*y)%1 + unzero
-    
-    # Start writing intermediate values
-    ranF = np.zeros((m*n),dtype=np.float)
-    for i in range(m*n//2):
-        x = (x + a*y)%1 + unzero
-        y = (b*x + c*y)%1 + unzero
-        ranF[2*i] = x
-        ranF[2*i+1] = y
-    
-    # Generate column-relocation vector
-    r = secGen.randint(1,m*n-n)
-    exp = 10**14
-    vec = np.zeros((n),dtype=np.uint16)
-    for i in range(n):
-        vec[i] = int((ranF[r+i]*exp)%m)
-
-    with open(logfile, 'a+') as f:
-        f.write(str(r))
-
-    return ranF, vec
-
-mod = SourceModule("""
-    #include <stdint.h>
-    __global__ void GenCatMap(uint8_t *in, uint8_t *out, uint16_t *colRotate, uint16_t *rowRotate)
-    {
-        int colShift = colRotate[blockIdx.y];
-        int rowShift = rowRotate[(blockIdx.x + colShift)%gridDim.x];
-        int InDex    = ((gridDim.y)*blockIdx.x + blockIdx.y) * 3  + threadIdx.x;
-        int OutDex   = ((gridDim.y)*((blockIdx.x + colShift)%gridDim.x) + (blockIdx.y + rowShift)%gridDim.y) * 3  + threadIdx.x;
-        out[OutDex]  = in[InDex];
-    }
-  """)
-
+# Driver function
 def Encrypt():
-    # Initiliaze timer
-    timer = np.zeros(3)
-    overalltime = time.perf_counter()
+    #Initialize perf_timer
+    perf_timer = np.zeros(4)
+    overall_time = perf_counter()
+    
+    # Read image & clear temp directories
+    img, dim, misc_timer = PreProcess()
 
-    # Read image
-    img, m, n = Init()
+    # Resize image for Arnold Mapping
+    misc_timer[3] = perf_counter()
+    if dim[0]!=dim[1]:
+        N = max(dim[0], dim[1])
+        img = cv2.resize(img,(N,N), interpolation=cv2.INTER_CUBIC)
+        dim = img.shape
 
-    timer[0] = time.perf_counter()
-    # Col-rotation | len(U)=n, values from 0->m
-    P1, U = genRelocVec(m,n,cfg.P1LOG)
-    timer[0] = time.perf_counter() - timer[0]
+    # Calculate no. of rounds
+    rounds = randint(8,16)
+    misc_timer[3] = perf_counter() - misc_timer[3]
+    
+    # Flatten image to vector,transfer to GPU
+    temp_timer = perf_counter()
+    imgArr = np.asarray(img).reshape(-1)
+    gpuimgIn = cuda.mem_alloc(imgArr.nbytes)
+    gpuimgOut = cuda.mem_alloc(imgArr.nbytes)
+    cuda.memcpy_htod(gpuimgIn, imgArr)
+    func = cf.mod.get_function("ArMapImg")
+    misc_timer[1] += perf_counter() - temp_timer
 
-    timer[1] = time.perf_counter()
-    # Row-rotation | len(V)=m, values from 0->n
-    P2, V = genRelocVec(n,m,cfg.P2LOG)
-    timer[1] = time.perf_counter() - timer[1]
+    # Warm-Up GPU for accurate benchmarking
+    if cfg.DEBUG_TIMER:
+        funcTemp = cf.mod.get_function("WarmUp")
+        funcTemp(grid=(1,1,1), block=(1,1,1))
 
-    imgArray  = np.asarray(img).reshape(-1)
-    gpuimgIn  = cuda.mem_alloc(imgArray.nbytes)
-    gpuimgOut = cuda.mem_alloc(imgArray.nbytes)
-    cuda.memcpy_htod(gpuimgIn, imgArray)
+    # Log no. of rounds of ArMapping
+    temp_timer = perf_counter()
+    with open(cfg.LOG, 'a+') as f:
+        f.write(str(rounds)+"\n")
+    misc_timer[2] += perf_counter() - temp_timer
+
+    # Perform Arnold Mapping
+    perf_timer[0] = perf_counter()
+    for i in range (max(rounds,5)):
+        func(gpuimgIn, gpuimgOut, grid=(dim[0],dim[1],1), block=(3,1,1))
+        gpuimgIn, gpuimgOut = gpuimgOut, gpuimgIn
+    perf_timer[0] = perf_counter() - perf_timer[0]
+
+    if cfg.DEBUG_IMAGES:
+        misc_timer[6] += cf.interImageWrite(gpuimgIn, "IN_1", len(imgArr), dim)
+
+    # Fractal XOR Phase
+    temp_timer = perf_counter()
+    fractal, misc_timer[4] = cf.getFractal(dim[0])
+    fracArr  = np.asarray(fractal).reshape(-1)
+    gpuFrac = cuda.mem_alloc(fracArr.nbytes)
+    cuda.memcpy_htod(gpuFrac, fracArr)
+    func = cf.mod.get_function("FracXOR")
+    misc_timer[4] = perf_counter() - temp_timer
+
+    perf_timer[1] = perf_counter()
+    func(gpuimgIn, gpuimgOut, gpuFrac, grid=(dim[0]*dim[1],1,1), block=(3,1,1))
+    perf_timer[1] = perf_counter() - perf_timer[1]
+
+    gpuimgIn, gpuimgOut = gpuimgOut, gpuimgIn
+
+    if cfg.DEBUG_IMAGES:
+        misc_timer[6] += cf.interImageWrite(gpuimgIn, "IN_2", len(imgArr), dim)
+
+    # Permutation: ArMap-based intra-row/column rotation
+    perf_timer[2] = perf_counter()
+    U = cf.genRelocVec(dim[0],dim[1],cfg.P1LOG, ENC=True) # Col-rotation | len(U)=n, values from 0->m
+    V = cf.genRelocVec(dim[1],dim[0],cfg.P2LOG, ENC=True) # Row-rotation | len(V)=m, values from 0->n
+    perf_timer[2] = perf_counter() - perf_timer[2]
+    
+    # Transfer rotation-vectors to GPU
+    misc_timer[5] = perf_counter()
     gpuU = cuda.mem_alloc(U.nbytes)
     gpuV = cuda.mem_alloc(V.nbytes)
     cuda.memcpy_htod(gpuU, U)
     cuda.memcpy_htod(gpuV, V)
-    func = mod.get_function("GenCatMap")
+    func = cf.mod.get_function("Enc_GenCatMap")
+    misc_timer[5] = perf_counter() - misc_timer[5]
 
-    func(gpuimgIn, gpuimgOut, gpuU, gpuV, grid=(m,n,1), block=(3,1,1))
-    temp = gpuimgIn
-    gpuimgIn = gpuimgOut
-    gpuimgOut = temp
-    timer[2] = time.perf_counter() - timer[2]
+    # Perform permutation
+    perf_timer[3] = perf_counter()
     for i in range(cfg.PERM_ROUNDS):
-        func(gpuimgIn, gpuimgOut, gpuU, gpuV, grid=(m,n,1), block=(3,1,1))
-        temp = gpuimgIn
-        gpuimgIn = gpuimgOut
-        gpuimgOut = temp
-    timer[2] = time.perf_counter() - timer[2]
+        func(gpuimgIn, gpuimgOut, gpuU, gpuV, grid=(dim[0],dim[1],1), block=(3,1,1))
+        gpuimgIn, gpuimgOut = gpuimgOut, gpuimgIn
+    perf_timer[3] = perf_counter() - perf_timer[3]
 
-    cuda.memcpy_dtoh(imgArray, gpuimgIn)
-    img = (np.reshape(imgArray,img.shape)).astype(np.uint8)
+    if cfg.DEBUG_IMAGES:
+        misc_timer[6] += cf.interImageWrite(gpuimgIn, "IN_3", len(imgArr), dim)
 
-    '''PERMUTATION PHASE COMPLETE'''
-
+    # Transfer vector back to host and reshape into encrypted output
+    temp_timer = perf_counter()
+    cuda.memcpy_dtoh(imgArr, gpuimgIn)
+    img = (np.reshape(imgArr,dim)).astype(np.uint8)
     cv2.imwrite(cfg.ENC_OUT, img)
-    overalltime = time.perf_counter() - overalltime
-    misc = overalltime - np.sum(timer)
-
+    misc_timer[1] += perf_counter() - temp_timer
+    
     # Print timing statistics
     if cfg.DEBUG_TIMER:
-        print("Target: {} ({}x{})".format(cfg.ENC_IN, n, m))
-        print("U Generation:\t{0:9.7f}s ({1:5.2f}%)".format(timer[0], timer[0]/overalltime*100))
-        print("V Generation:\t{0:9.7f}s ({1:5.2f}%)".format(timer[1], timer[1]/overalltime*100))
-        print("Permutation:\t{0:9.7f}s ({1:7.5f}%)".format(timer[2], timer[2]/overalltime*100))
-        print("Misc. ops: \t{0:9.7f}s ({1:5.2f}%)".format(misc, misc/overalltime*100))
-        print("Net Time: \t{0:7.5f}s\n".format(overalltime))
+        overall_time = perf_counter() - overall_time
+        perf = np.sum(perf_timer)
+        misc = np.sum(misc_timer)
 
+        print("\nTarget: {} ({}x{})".format(cfg.ENC_IN, dim[1], dim[0]))    
+
+        print("\nPERF. OPS: \t{0:9.7f}s ({1:5.2f}%)".format(perf, perf/overall_time*100))
+        print("ArMap Kernel:\t{0:9.7f}s ({1:5.2f}%)".format(perf_timer[0], perf_timer[0]/overall_time*100))   
+        print("XOR Kernel: \t{0:9.7f}s ({1:5.2f}%)".format(perf_timer[1], perf_timer[1]/overall_time*100))
+        print("Shuffle Gen: \t{0:9.7f}s ({1:5.2f}%)".format(perf_timer[2], perf_timer[2]/overall_time*100))
+        print("Perm. Kernel:\t{0:9.7f}s ({1:5.2f}%)".format(perf_timer[3], perf_timer[3]/overall_time*100))
+
+        print("\nMISC. OPS: \t{0:9.7f}s ({1:5.2f}%)".format(misc, misc/overall_time*100))
+        print("Dir. Cleanup:\t{0:9.7f}s ({1:5.2f}%)".format(misc_timer[0], misc_timer[0]/overall_time*100)) 
+        print("I/O:\t\t{0:9.7f}s ({1:5.2f}%)".format(misc_timer[1], misc_timer[1]/overall_time*100))
+        print("Logging:\t{0:9.7f}s ({1:5.2f}%)".format(misc_timer[2], misc_timer[2]/overall_time*100))
+        print("ArMap Misc:\t{0:9.7f}s ({1:5.2f}%)".format(misc_timer[3], misc_timer[3]/overall_time*100)) 
+        print("FracXOR Misc:\t{0:9.7f}s ({1:5.2f}%)".format(misc_timer[4], misc_timer[4]/overall_time*100)) 
+        print("Permute Misc:\t{0:9.7f}s ({1:5.2f}%)".format(misc_timer[5], misc_timer[5]/overall_time*100))
+
+        if cfg.DEBUG_IMAGES:
+            print("Debug Images:\t{0:9.7f}s ({1:5.2f}%)".format(misc_timer[6], misc_timer[6]/overall_time*100))
+
+        print("\nNET TIME:\t{0:7.5f}s\n".format(overall_time))
+    
 Encrypt()
 cv2.waitKey(0)
 cv2.destroyAllWindows()
